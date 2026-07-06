@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -18,6 +19,23 @@ import (
 // Keeping the key here means the server keeps the same PeerID (and thus
 // the same dialable address) across restarts.
 const identityKeyPath = "server_identity.key"
+
+// splitNonEmpty splits a comma-separated env var into a clean []string,
+// dropping empty entries so an unset/blank RELAY_ADDRS just means "no
+// relay candidates" instead of one bogus empty-string entry.
+func splitNonEmpty(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
 
 func main() {
 
@@ -30,8 +48,16 @@ func main() {
 	// expressed as a libp2p multiaddr instead of a bare net.Listen call.
 	listenAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", protocol.PORT)
 
+	// RELAY_ADDRS: comma-separated relay multiaddrs, each including
+	// /p2p/<PeerID> — e.g. the address relay/main.go prints on startup.
+	// Leave it unset to run with no relay support at all (Phase 1 mode).
+	staticRelays, err := p2p.StaticRelayAddrs(splitNonEmpty(os.Getenv("RELAY_ADDRS")))
+	if err != nil {
+		log.Fatal("bad RELAY_ADDRS: ", err)
+	}
+
 	// this creates a host with the given private key, and our given listenaddr, and some additional settings provided int he NewHost func
-	h, err := p2p.NewHost(priv, listenAddr)
+	h, err := p2p.NewHost(priv, []string{listenAddr}, staticRelays)
 	if err != nil {
 		log.Fatal("libp2p host creation failed: ", err)
 	}

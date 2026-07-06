@@ -16,6 +16,23 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
+// splitNonEmpty splits a comma-separated env var into a clean []string,
+// dropping empty entries so an unset/blank RELAY_ADDRS just means "no
+// relay candidates" instead of one bogus empty-string entry.
+func splitNonEmpty(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 // RequestFile sends the "what to do" header (method + path) — same wire
 // format as the TCP version, just written to a network.Stream instead of
 // a *net.TCPConn, network.Stream satisfies io.Writer
@@ -68,7 +85,14 @@ func main() {
 		log.Fatal("couldn't generate client identity: ", err)
 	}
 
-	h, err := p2p.NewHost(priv) // no listenAddrs -> pure outbound client
+	// Same RELAY_ADDRS convention as the server — comma-separated
+	// multiaddrs, each including /p2p/<PeerID>.
+	staticRelays, err := p2p.StaticRelayAddrs(splitNonEmpty(os.Getenv("RELAY_ADDRS")))
+	if err != nil {
+		log.Fatal("bad RELAY_ADDRS: ", err)
+	}
+
+	h, err := p2p.NewHost(priv, nil, staticRelays) // no listenAddrs -> pure outbound client
 	// Can connect to others, cannot accept incoming connections
 	if err != nil {
 		log.Fatal("libp2p host creation failed: ", err)
