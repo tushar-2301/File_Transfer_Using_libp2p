@@ -7,8 +7,12 @@
 package p2p
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -107,8 +111,6 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 	opts := []libp2p.Option{
 		libp2p.Identity(priv), // tells libp2p to use the given key, or else it will create its own
 		libp2p.NATPortMap(),   // best-effort UPnP/NAT-PMP port mapping for reachability
-		libp2p.EnableRelay(),
-		libp2p.ForceReachabilityPrivate(), // newly added
 		// EnableRelay lets THIS host make outbound connections through a
 		// relay and accept inbound relayed connections — it's the
 		// "can use a relay" switch, as opposed to EnableRelayService
@@ -117,6 +119,15 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 		// explicitly since it's load-bearing for Phase 2.
 		// lip2p.EnableRelayService() --> is used to configure the  current host to act as a relay
 		// libp2p.EnableRelay() --> is used to tell that the current host can use a relay to connect with others
+		libp2p.EnableRelay(),
+		libp2p.ForceReachabilityPrivate(), // this is very imppppp
+		// AutoRelay only starts trying to reserve a slot on your static relays once it's confirmed (via AutoNAT) that this host is NOT publicly reachable. AutoNAT confirms that by having other peers dial back to you and report success/failure — which requires inbound connection attempts from peers who also run AutoNAT. Your Server, sitting alone with zero peers ever having connected to it, has no way to get that confirmation. So AutoRelay just sits there indefinitely in "reachability unknown" limbo, never triggering a reservation — no error, no timeout, just silence
+
+		// once a relayed connection to a peer exists, this turns on the DCUtR (Direct Connection Upgrade through Relay) protocol
+		// — both sides exchange their observed/candidate addresses over the relayed stream and attempt a synchronized ("hole punch") direct dial at each other. If it succeeds, libp2p ends up with
+		// a second, direct connection to the same peer, and the swarm
+		// prefers that direct connection for any NEW streams from then on — the relay drops out of the data path without either side having to change any application code.
+		libp2p.EnableHolePunching(),
 	}
 
 	// adds the given listening addrs to the opts, which would be given during creating a new host. If there is no listening addr, given to this host, then it means that there is no use keeping the listening socket open for this port, and we set it to libp2p.NoListenAddrs, which means that this host can only dial in other hosts, but it wont accept any incoming requests
@@ -135,6 +146,7 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 	if len(staticRelays) > 0 {
 		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(
 			staticRelays,
+			// these 3 .With were added while debugging, since after running server.go it was not printing the public addr required to be given to the client.go, and neither was it giving any error it was just silently failing
 			autorelay.WithBootDelay(0),     // don't wait before trying
 			autorelay.WithMinCandidates(1), // 1 candidate is enough to act on
 			autorelay.WithNumRelays(1),     // we only need/have 1 relay anyway
@@ -143,4 +155,92 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 	// basicaly the above line is doing "Monitor whether I'm publicly reachable. If AutoNAT determines I'm behind a NAT, automatically connect to one of these known relay servers, reserve a relay slot, and advertise a relay address so other peers can still reach me. If I later become directly reachable (for example, after successful hole punching), libp2p can prefer the direct connection instead."
 
 	return libp2p.New(opts...)
+}
+
+// isRelayedAddr reports whether a connection's remote multiaddr goes through a circuit-v2 relay hop (contains "/p2p-circuit") as opposed to being a direct address. This is the simplest reliable way to tell a relayed connection apart from a direct one without depending on go-libp2p's internal holepunch tracing types.
+func isRelayedAddr(addr multiaddr.Multiaddr) bool {
+	return strings.Contains(addr.String(), "/p2p-circuit")
+}
+
+// ConnKind describes what a connection to a peer currently looks like.
+type ConnKind int
+
+const (
+	NoConn ConnKind = iota
+	Relayed
+	Direct
+)
+
+// connKindToPeer inspects the swarm's current connections to p and
+// reports the "best" one: Direct if any non-relayed connection exists,
+// Relayed if only circuit connections exist, NoConn if there's nothing.
+func connKindToPeer(h host.Host, p peer.ID) ConnKind {
+	conns := h.Network().ConnsToPeer(p) // This returns every connection currently open to that peer
+	// if the host is connected to the peer, then the peer would be present in the network of host h, thus h.Network()
+	if len(conns) == 0 {
+		return NoConn
+	}
+	best := Relayed
+	for _, c := range conns {
+		if !isRelayedAddr(c.RemoteMultiaddr()) { // we basically check for each of the conn in conns if its relayed/ direct
+			return Direct
+		}
+	}
+	return best
+}
+
+// This is just the monitoring function
+// WatchForDirectUpgrade polls the connections to peer p and logs the moment a relayed connection is joined (or replaced) by a direct one i.e. "hole punch succeeded, relay is out of the data path" moment
+
+// It also logs a StartHolePunch-equivalent line the first time it sees a relayed connection, and gives up (logging that hole punching didn't complete) after timeout, in which case the relayed connection simply keeps serving as the fallback path.
+
+// Runs in its own goroutine; safe to call and forget.
+func WatchForDirectUpgrade(ctx context.Context, h host.Host, p peer.ID, timeout time.Duration) {
+	go func() {
+		deadline := time.After(timeout)
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+
+		announcedRelayed := false // this is just a flag ensuring that if the StartHolePunch msg has been printed once, and if its printed once do not print again or else it would keep printing that every 300ms
+
+		for {
+			select {
+			case <-ctx.Done(): // if the ctx is cancelled then Stop monitoring
+				return
+			case <-deadline: // timed out
+				if !announcedRelayed {
+					return // never even got a relayed connection; nothing to report
+				}
+				if connKindToPeer(h, p) != Direct {
+					log.Printf("[holepunch] timed out waiting for a direct connection to %s; staying on the relayed connection (Phase 6 fallback path)", p)
+				}
+				return
+			case <-ticker.C:
+				switch connKindToPeer(h, p) {
+				case Relayed:
+					if !announcedRelayed {
+						announcedRelayed = true
+						log.Printf("[holepunch] StartHolePunch: connected to %s via relay, attempting direct upgrade...", p)
+					}
+				case Direct:
+					if announcedRelayed {
+						log.Printf("[holepunch] EndHolePunch: direct connection to %s established — relay is now out of the data path for this session", p)
+					} else {
+						log.Printf("[holepunch] connected to %s directly (no relay hop needed)", p)
+					}
+					return
+				case NoConn:
+					// not connected yet; keep polling until deadline
+				}
+			}
+		}
+	}()
+}
+
+// ClientListenAddrs returns a listen address for a peer that otherwise has no need to be dialed directly by a human (e.g. the CLI client).
+// It listens on an OS-assigned ephemeral TCP port on all interfaces.
+
+// hole punching is a *simultaneous* dial from both sides. A host built with libp2p.NoListenAddrs has no listening socket at all, so it can't be the target of the inbound half of that simultaneous dial, and DCUtR can't upgrade the connection — it would stay relayed forever. Giving even a pure "client" role an ephemeral listener fixes that without requiring the user to pick or forward a port.
+func ClientListenAddrs() []string {
+	return []string{"/ip4/0.0.0.0/tcp/0"}
 }

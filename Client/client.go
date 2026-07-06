@@ -92,8 +92,12 @@ func main() {
 		log.Fatal("bad RELAY_ADDRS: ", err)
 	}
 
-	h, err := p2p.NewHost(priv, nil, staticRelays) // no listenAddrs -> pure outbound client
-	// Can connect to others, cannot accept incoming connections
+	// Phase 3: give the client an ephemeral listen socket too. Hole
+	// punching is a simultaneous dial from both sides — a host with no
+	// listen socket at all (the old NoListenAddrs behavior) can never be
+	// the target of the inbound half of that dial, so the connection to
+	// the server would stay relayed forever. See P2P.ClientListenAddrs.
+	h, err := p2p.NewHost(priv, p2p.ClientListenAddrs(), staticRelays)
 	if err != nil {
 		log.Fatal("libp2p host creation failed: ", err)
 	}
@@ -120,6 +124,15 @@ func main() {
 		log.Fatal("libp2p connection wasnt established : ", err)
 	}
 	fmt.Println("libp2p connection established with", info.ID)
+
+	// this gives DCUtR a window to upgrade the relayed connection to
+	// a direct one before we open the transfer stream. WatchForDirectUpgrade
+	// logs the transition; new streams opened after the upgrade completes
+	// naturally ride the direct connection instead of the relay.
+	watchCtx, cancelWatch := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelWatch()
+	p2p.WatchForDirectUpgrade(watchCtx, h, info.ID, 10*time.Second)
+	time.Sleep(3 * time.Second) // brief grace period for the hole punch attempt to run
 
 	// Opening a stream here is the libp2p equivalent of net.DialTCP
 	// returning a *net.TCPConn: after this call, s behaves like any

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	controllers "file_transfer/Controllers"
 	p2p "file_transfer/P2P"
@@ -14,8 +15,25 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/multiformats/go-multiaddr"
 )
+
+// connLogger implements network.Notifiee just enough to kick off a
+// WatchForDirectUpgrade goroutine every time a new connection to a peer
+// shows up, so the server side (not just the dialing client side) prints
+// the Phase 3 relayed -> direct transition in its own logs.
+type connLogger struct {
+	h host.Host
+}
+
+func (c *connLogger) Connected(_ network.Network, conn network.Conn) {
+	p2p.WatchForDirectUpgrade(context.Background(), c.h, conn.RemotePeer(), 15*time.Second)
+}
+func (c *connLogger) Disconnected(network.Network, network.Conn)       {}
+func (c *connLogger) Listen(network.Network, multiaddr.Multiaddr)      {}
+func (c *connLogger) ListenClose(network.Network, multiaddr.Multiaddr) {}
 
 // Keeping the key here means the server keeps the same PeerID (and thus
 // the same dialable address) across restarts.
@@ -80,6 +98,12 @@ func main() {
 	// exactly like `go HandleConn(conn)` did per incoming TCP connection.
 	// It tells libp2p "Whenever somebody opens a stream for protocol p2p.ProtocolID, call HandleStream."
 	h.SetStreamHandler(p2p.ProtocolID, HandleStream)
+
+	// Phase 3: log the relayed->direct upgrade from the server side too.
+	// Every time a new peer connects, watch its connection for up to 15s
+	// to see if DCUtR manages to establish a direct connection alongside
+	// (or instead of) the relayed one.
+	h.Network().Notify(&connLogger{h: h})
 
 	// Block until interrupted (Ctrl+C), instead of `for true { Accept() }`.
 	sigCh := make(chan os.Signal, 1) // this is creating a channel of type (chan os.Signal) which is an interface representing an operating system signal. Also the buffer given is 1, so that we can at everytime store the last OS signal, without the buffer both the sender and receiver must rendezvous exactly at the same time.
