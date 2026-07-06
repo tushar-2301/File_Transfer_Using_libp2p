@@ -11,6 +11,7 @@
 package main
 
 import (
+	"encoding/base64"
 	p2p "file_transfer/P2P"
 	"fmt"
 	"log"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 )
 
@@ -26,8 +28,49 @@ import (
 // box (or same Render instance during local testing) doesn't clash.
 const identityKeyPath = "relay_identity.key"
 
+// loadIdentity prefers RELAY_PRIVKEY_B64 (a base64-encoded marshaled
+// private key) over the on-disk identityKeyPath.
+//
+// This matters specifically for Render's free/Starter tier: the
+// container filesystem is ephemeral, so relay_identity.key gets wiped on
+// every restart/redeploy, which silently generates a brand-new PeerID
+// each time — breaking whatever RELAY_ADDRS you'd already handed out.
+// Render env vars, by contrast, persist across restarts/redeploys
+// without needing a paid persistent disk, so storing the key there
+// keeps the PeerID stable for free.
+func loadIdentity(keyPath string) (crypto.PrivKey, error) {
+	if b64 := os.Getenv("RELAY_PRIVKEY_B64"); b64 != "" {
+		data, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, fmt.Errorf("bad RELAY_PRIVKEY_B64: %w", err)
+		}
+		return crypto.UnmarshalPrivateKey(data)
+	}
+
+	// No env var set: fall back to file-based persistence (fine for
+	// local/VPS runs where the filesystem isn't ephemeral), and print
+	// the base64 form once so it can be copied into Render's env vars.
+	priv, err := p2p.LoadOrCreateIdentity(keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := crypto.MarshalPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Println("No RELAY_PRIVKEY_B64 set — generated/loaded identity from disk instead.")
+	fmt.Println("To keep this PeerID stable across Render restarts/redeploys, copy the")
+	fmt.Println("following into a Render env var named RELAY_PRIVKEY_B64 (mark it Secret):")
+	fmt.Println(base64.StdEncoding.EncodeToString(data))
+	fmt.Println()
+
+	return priv, nil
+}
+
 func main() {
-	priv, err := p2p.LoadOrCreateIdentity(identityKeyPath)
+	priv, err := loadIdentity(identityKeyPath)
 	if err != nil {
 		log.Fatal("couldn't load/create relay identity: ", err)
 	}
@@ -46,7 +89,6 @@ func main() {
 		),
 
 		// Without it, your node is just a normal libp2p peer. With it, your node becomes a relay server
-
 		// This relay serves no one but us, at demo scale, for sessions
 		// capped by nothing but our own patience — so disabling the
 		// default 2-minute-per-circuit / data-cap limit is a reasonable
