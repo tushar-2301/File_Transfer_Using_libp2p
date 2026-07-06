@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -107,6 +108,7 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 		libp2p.Identity(priv), // tells libp2p to use the given key, or else it will create its own
 		libp2p.NATPortMap(),   // best-effort UPnP/NAT-PMP port mapping for reachability
 		libp2p.EnableRelay(),
+		libp2p.ForceReachabilityPrivate(), // newly added
 		// EnableRelay lets THIS host make outbound connections through a
 		// relay and accept inbound relayed connections — it's the
 		// "can use a relay" switch, as opposed to EnableRelayService
@@ -131,7 +133,12 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 	// peer has *something* dialable even before/if hole punching (Phase
 	// 3) succeeds.
 	if len(staticRelays) > 0 {
-		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(staticRelays))
+		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(
+			staticRelays,
+			autorelay.WithBootDelay(0),     // don't wait before trying
+			autorelay.WithMinCandidates(1), // 1 candidate is enough to act on
+			autorelay.WithNumRelays(1),     // we only need/have 1 relay anyway
+		))
 	}
 	// basicaly the above line is doing "Monitor whether I'm publicly reachable. If AutoNAT determines I'm behind a NAT, automatically connect to one of these known relay servers, reserve a relay slot, and advertise a relay address so other peers can still reach me. If I later become directly reachable (for example, after successful hole punching), libp2p can prefer the direct connection instead."
 
