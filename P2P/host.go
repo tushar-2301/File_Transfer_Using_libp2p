@@ -18,7 +18,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+	circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	ws "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -105,7 +108,7 @@ func StaticRelayAddrs(addrs []string) ([]peer.AddrInfo, error) {
 // this as a pool it holds reservations across and backs off from
 // whichever candidates don't respond — nil/empty just means "no relay
 // support for this host" (e.g. the relay binary itself doesn't need it).
-func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.AddrInfo) (host.Host, error) {
+func NewHost(ctx context.Context, priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.AddrInfo) (host.Host, error) {
 
 	// these are options to be provided while creating a new host
 	opts := []libp2p.Option{
@@ -120,7 +123,12 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 		// lip2p.EnableRelayService() --> is used to configure the  current host to act as a relay
 		// libp2p.EnableRelay() --> is used to tell that the current host can use a relay to connect with others
 		libp2p.EnableRelay(),
-		libp2p.ForceReachabilityPrivate(), // this is very imppppp
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Transport(quic.NewTransport),
+		libp2p.Transport(ws.New),
+
+		// libp2p.ForceReachabilityPrivate(), // this is very imppppp
+
 		// AutoRelay only starts trying to reserve a slot on your static relays once it's confirmed (via AutoNAT) that this host is NOT publicly reachable. AutoNAT confirms that by having other peers dial back to you and report success/failure — which requires inbound connection attempts from peers who also run AutoNAT. Your Server, sitting alone with zero peers ever having connected to it, has no way to get that confirmation. So AutoRelay just sits there indefinitely in "reachability unknown" limbo, never triggering a reservation — no error, no timeout, just silence
 
 		// once a relayed connection to a peer exists, this turns on the DCUtR (Direct Connection Upgrade through Relay) protocol
@@ -143,18 +151,41 @@ func NewHost(priv crypto.PrivKey, listenAddrs []string, staticRelays []peer.Addr
 	// and starts advertising a relayed address through it, so the other
 	// peer has *something* dialable even before/if hole punching (Phase
 	// 3) succeeds.
-	if len(staticRelays) > 0 {
-		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(
-			staticRelays,
-			// these 3 .With were added while debugging, since after running server.go it was not printing the public addr required to be given to the client.go, and neither was it giving any error it was just silently failing
-			autorelay.WithBootDelay(0),     // don't wait before trying
-			autorelay.WithMinCandidates(1), // 1 candidate is enough to act on
-			autorelay.WithNumRelays(1),     // we only need/have 1 relay anyway
-		))
-	}
+	// if len(staticRelays) > 0 {
+	// 	opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(
+	// 		staticRelays,
+	// 		// these 3 .With were added while debugging, since after running server.go it was not printing the public addr required to be given to the client.go, and neither was it giving any error it was just silently failing
+	// 		autorelay.WithBootDelay(0),     // don't wait before trying
+	// 		autorelay.WithMinCandidates(1), // 1 candidate is enough to act on
+	// 		autorelay.WithNumRelays(1),     // we only need/have 1 relay anyway
+	// 	))
+	// }
 	// basicaly the above line is doing "Monitor whether I'm publicly reachable. If AutoNAT determines I'm behind a NAT, automatically connect to one of these known relay servers, reserve a relay slot, and advertise a relay address so other peers can still reach me. If I later become directly reachable (for example, after successful hole punching), libp2p can prefer the direct connection instead."
 
-	return libp2p.New(opts...)
+	h, err := libp2p.New(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Deterministic relay reservation, kept alive for the life of the
+	// process — see keepReservationAlive below for why a one-shot
+	// Reserve() isn't enough on its own.
+	for _, relay := range staticRelays {
+		if err := h.Connect(ctx, relay); err != nil {
+			fmt.Printf("could not connect to relay %s: %v\n", relay.ID, err)
+			continue
+		}
+		rsvp, err := circuit.Reserve(ctx, h, relay)
+		if err != nil {
+			fmt.Printf("could not reserve slot on relay %s: %v\n", relay.ID, err)
+			continue
+		}
+		fmt.Printf("reserved a slot on relay %s (expires %s)\n", relay.ID, rsvp.Expiration)
+		go keepReservationAlive(h, relay, rsvp)
+	}
+
+	return h, nil
+
 }
 
 // isRelayedAddr reports whether a connection's remote multiaddr goes through a circuit-v2 relay hop (contains "/p2p-circuit") as opposed to being a direct address. This is the simplest reliable way to tell a relayed connection apart from a direct one without depending on go-libp2p's internal holepunch tracing types.
@@ -212,7 +243,9 @@ func WatchForDirectUpgrade(ctx context.Context, h host.Host, p peer.ID, timeout 
 					return // never even got a relayed connection; nothing to report
 				}
 				if connKindToPeer(h, p) != Direct {
-					log.Printf("[holepunch] timed out waiting for a direct connection to %s; staying on the relayed connection (Phase 6 fallback path)", p)
+					known := h.Peerstore().Addrs(p)
+					log.Printf("[holepunch] timed out waiting for a direct connection to %s; staying on relayed connection", p)
+					log.Printf("[holepunch] known/observed addresses for %s: %v", p, known)
 				}
 				return
 			case <-ticker.C:
@@ -242,5 +275,35 @@ func WatchForDirectUpgrade(ctx context.Context, h host.Host, p peer.ID, timeout 
 
 // hole punching is a *simultaneous* dial from both sides. A host built with libp2p.NoListenAddrs has no listening socket at all, so it can't be the target of the inbound half of that simultaneous dial, and DCUtR can't upgrade the connection — it would stay relayed forever. Giving even a pure "client" role an ephemeral listener fixes that without requiring the user to pick or forward a port.
 func ClientListenAddrs() []string {
-	return []string{"/ip4/0.0.0.0/tcp/0"}
+	return []string{
+		"/ip4/0.0.0.0/tcp/0",
+		"/ip4/0.0.0.0/udp/0/quic-v1",
+	}
+}
+
+// keepReservationAlive re-reserves a relay slot shortly before it
+// expires, for as long as this host is running. Without this, a
+// long-lived server process ends up with a *stale* reservation: the
+// process looks healthy, the Peer ID hasn't changed, but the relay
+// has quietly forgotten about it, and every subsequent dial through
+// /p2p-circuit/.../p2p/<serverID> fails with NO_RESERVATION.
+func keepReservationAlive(h host.Host, relay peer.AddrInfo, rsvp *circuit.Reservation) {
+	for {
+		wait := time.Until(rsvp.Expiration) - 30*time.Second
+		if wait < 5*time.Second {
+			wait = 5 * time.Second
+		}
+		time.Sleep(wait)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		newRsvp, err := circuit.Reserve(ctx, h, relay)
+		cancel()
+		if err != nil {
+			log.Printf("[relay] failed to renew reservation on %s: %v — will retry shortly", relay.ID, err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		rsvp = newRsvp
+		log.Printf("[relay] renewed reservation on %s (expires %s)", relay.ID, rsvp.Expiration)
+	}
 }

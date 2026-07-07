@@ -92,12 +92,16 @@ func main() {
 		log.Fatal("bad RELAY_ADDRS: ", err)
 	}
 
+	// this is just implementing a timeout for the connection to establish, this context will be feeded while creating the new connection
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Phase 3: give the client an ephemeral listen socket too. Hole
 	// punching is a simultaneous dial from both sides — a host with no
 	// listen socket at all (the old NoListenAddrs behavior) can never be
 	// the target of the inbound half of that dial, so the connection to
 	// the server would stay relayed forever. See P2P.ClientListenAddrs.
-	h, err := p2p.NewHost(priv, p2p.ClientListenAddrs(), staticRelays)
+	h, err := p2p.NewHost(ctx, priv, p2p.ClientListenAddrs(), staticRelays)
 	if err != nil {
 		log.Fatal("libp2p host creation failed: ", err)
 	}
@@ -114,10 +118,6 @@ func main() {
 	if err != nil {
 		log.Fatal("couldn't extract peer info from multiaddr: ", err)
 	}
-
-	// this is just implementing a timeout for the connection to establish, this context will be feeded while creating the new connection
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 
 	// this just establishes a conn between the client and the given peerID
 	if err := h.Connect(ctx, *info); err != nil {

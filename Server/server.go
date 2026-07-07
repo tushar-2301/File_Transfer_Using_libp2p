@@ -66,6 +66,7 @@ func main() {
 	// Listen on all interfaces, same PORT the TCP version used, just
 	// expressed as a libp2p multiaddr instead of a bare net.Listen call.
 	listenAddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", protocol.PORT)
+	quicListenAddr := fmt.Sprintf("/ip4/0.0.0.0/udp/%s/quic-v1", protocol.PORT)
 
 	// RELAY_ADDRS: comma-separated relay multiaddrs, each including
 	// /p2p/<PeerID> — e.g. the address relay/main.go prints on startup.
@@ -76,7 +77,8 @@ func main() {
 	}
 
 	// this creates a host with the given private key, and our given listenaddr, and some additional settings provided int he NewHost func
-	h, err := p2p.NewHost(priv, []string{listenAddr}, staticRelays)
+	ctx := context.Background()
+	h, err := p2p.NewHost(ctx, priv, []string{listenAddr, quicListenAddr}, staticRelays)
 	if err != nil {
 		log.Fatal("libp2p host creation failed: ", err)
 	}
