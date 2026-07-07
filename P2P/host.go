@@ -16,6 +16,7 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	circuit "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
@@ -167,6 +168,8 @@ func NewHost(ctx context.Context, priv crypto.PrivKey, listenAddrs []string, sta
 		return nil, err
 	}
 
+	LogIdentifyEvents(h)
+
 	// Deterministic relay reservation, kept alive for the life of the
 	// process — see keepReservationAlive below for why a one-shot
 	// Reserve() isn't enough on its own.
@@ -306,4 +309,40 @@ func keepReservationAlive(h host.Host, relay peer.AddrInfo, rsvp *circuit.Reserv
 		rsvp = newRsvp
 		log.Printf("[relay] renewed reservation on %s (expires %s)", relay.ID, rsvp.Expiration)
 	}
+}
+
+// CircuitAddr builds the dialable "/p2p-circuit" multiaddr for this
+// host through a given relay, e.g.:
+//
+//	/dns4/relay.onrender.com/tcp/443/wss/p2p/<relayID>/p2p-circuit/p2p/<selfID>
+//
+// We build this ourselves rather than reading it off h.Addrs(),
+// because AutoRelay (which normally adds it there automatically once
+// a reservation exists) is disabled in favor of the deterministic
+// Reserve()+renew loop above — nothing else populates h.Addrs() with
+// a circuit entry, even though the reservation itself is real.
+func CircuitAddr(relay peer.AddrInfo, self peer.ID) string {
+	if len(relay.Addrs) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s", relay.Addrs[0], relay.ID, self)
+}
+
+// LogIdentifyEvents subscribes to the eventbus and logs, in real time,
+// what listen addresses each peer we identify actually reports having.
+// This is the ground-truth answer to "does DCUtR have anything to
+// dial" — more reliable than reading Peerstore().Addrs() after the
+// fact, which can reflect filtering/timing we can't see from outside.
+func LogIdentifyEvents(h host.Host) {
+	sub, err := h.EventBus().Subscribe(new(event.EvtPeerIdentificationCompleted))
+	if err != nil {
+		log.Printf("[identify] couldn't subscribe: %v", err)
+		return
+	}
+	go func() {
+		for e := range sub.Out() {
+			evt := e.(event.EvtPeerIdentificationCompleted)
+			log.Printf("[identify] completed with %s — they report listen addrs: %v", evt.Peer, evt.ListenAddrs)
+		}
+	}()
 }

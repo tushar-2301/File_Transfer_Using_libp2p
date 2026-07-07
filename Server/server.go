@@ -90,9 +90,17 @@ func main() {
 	// h.Addrs() returns all addresses on which this host is listening, the addr would be smth like /ip4/127.0.0.1/tcp/4001, this provides the info about the protocol, ip, port, but just giving this to the client wont be enough, bcoz the client needs the peerID of the server(or whatever to the other person that its trying to connect(btw there are no server and client in libp2p, all are just hosts))
 	// So here we are creating the multiaddr which are required to be given to the client in order to connect to this server
 	time.Sleep(15 * time.Second)
+
 	for _, addr := range h.Addrs() {
 		fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
 	}
+
+	for _, relay := range staticRelays {
+		if addr := p2p.CircuitAddr(relay, h.ID()); addr != "" {
+			fmt.Println("  " + addr)
+		}
+	}
+
 	fmt.Println("\nGive one of the addresses above (with /p2p/<PeerID>) to the client.")
 
 	// SetStreamHandler is the libp2p equivalent of the old Accept() loop:
